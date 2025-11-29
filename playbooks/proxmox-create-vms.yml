@@ -1,0 +1,98 @@
+---
+- name: Create VMs on Proxmox by cloning template
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  pre_tasks:
+    - name: Load Proxmox variables from inventory
+      set_fact:
+        proxmox_host: "{{ hostvars[groups['k3s_cluster'][0]]['proxmox_host'] }}"
+        proxmox_node: "{{ hostvars[groups['k3s_cluster'][0]]['proxmox_node'] }}"
+        proxmox_user: "{{ hostvars[groups['k3s_cluster'][0]]['proxmox_user'] }}"
+        proxmox_password: "{{ hostvars[groups['k3s_cluster'][0]]['proxmox_password'] }}"
+        proxmox_validate_certs: "{{ hostvars[groups['k3s_cluster'][0]]['proxmox_validate_certs'] }}"
+        proxmox_template_vmid: "{{ hostvars[groups['k3s_cluster'][0]]['proxmox_template_vmid'] }}"
+        proxmox_template_name: "{{ hostvars[groups['k3s_cluster'][0]]['proxmox_template_name'] }}"
+        proxmox_vm_memory: "{{ hostvars[groups['k3s_cluster'][0]]['proxmox_vm_memory'] }}"
+        proxmox_vm_cores: "{{ hostvars[groups['k3s_cluster'][0]]['proxmox_vm_cores'] }}"
+        proxmox_vm_sockets: "{{ hostvars[groups['k3s_cluster'][0]]['proxmox_vm_sockets'] }}"
+
+    - name: Generate VM list from inventory
+      set_fact:
+        vms_to_create: "{{ vms_to_create | default([]) + [{'name': item, 'ip': hostvars[item]['ansible_host']}] }}"
+      loop: "{{ groups['k3s_cluster'] | default([]) }}"
+      when: 
+        - item is defined
+        - hostvars[item]['ansible_host'] is defined
+
+  tasks:
+    - name: Check if proxmoxer is installed
+      command: python3 -c "import proxmoxer"
+      register: proxmoxer_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install proxmoxer Python library
+      pip:
+        name: proxmoxer
+        state: present
+      when: proxmoxer_check.rc != 0
+
+    - name: Check if each VM exists by name
+      community.general.proxmox_kvm:
+        api_host: "{{ proxmox_host }}"
+        api_user: "{{ proxmox_user }}"
+        api_password: "{{ proxmox_password }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        name: "{{ item.name }}"
+        node: "{{ proxmox_node }}"
+        state: current
+      loop: "{{ vms_to_create }}"
+      register: vm_check
+      failed_when: false
+      changed_when: false
+
+    - name: Clone VMs that don't exist
+      community.general.proxmox_kvm:
+        api_host: "{{ proxmox_host }}"
+        api_user: "{{ proxmox_user }}"
+        api_password: "{{ proxmox_password }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        clone: "{{ proxmox_template_name }}"
+        name: "{{ item.item.name }}"
+        node: "{{ proxmox_node }}"
+        full: false
+        timeout: 500
+        proxmox_default_behavior: no_defaults
+      loop: "{{ vm_check.results }}"
+      when: "'does not exist' in item.msg"
+      register: clone_results
+
+    - name: Start all VMs
+      community.general.proxmox_kvm:
+        api_host: "{{ proxmox_host }}"
+        api_user: "{{ proxmox_user }}"
+        api_password: "{{ proxmox_password }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        name: "{{ item.name }}"
+        node: "{{ proxmox_node }}"
+        state: started
+      loop: "{{ vms_to_create }}"
+      register: start_results
+      ignore_errors: true
+
+    - name: Display VM status summary
+      debug:
+        msg: |
+          VM Status Summary:
+          - Template: {{ proxmox_template_name }} (VMID: {{ proxmox_template_vmid }})
+          - Proxmox Host: {{ proxmox_host }}
+          - Proxmox Node: {{ proxmox_node }}
+          
+          VMs from inventory:
+          {% for vm in vms_to_create %}
+          - {{ vm.name }} (IP: {{ vm.ip }})
+          {% endfor %}
+          
+          Note: Existing VMs were skipped. Only missing VMs were cloned as linked clones.

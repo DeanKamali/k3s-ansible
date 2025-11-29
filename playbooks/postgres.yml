@@ -1,0 +1,159 @@
+---
+- name: Install and configure PostgreSQL
+  hosts: test-postgres
+  become: true
+  gather_facts: true
+
+  vars:
+    postgres_port: 5432
+    postgres_listen_addresses: "*"  # Listen on all interfaces
+    allowed_networks: "10.10.0.0/24"  # Allow connections from the cluster network
+    k3s_db_name: "k3s"
+    k3s_db_user: "k3s"
+    k3s_db_password: "k3s_password_change_me"  # Change this to a secure password
+
+  tasks:
+    - name: Install PostgreSQL (Debian/Ubuntu)
+      apt:
+        name:
+          - postgresql
+          - postgresql-contrib
+        state: present
+        update_cache: true
+      when: ansible_os_family == "Debian"
+
+    - name: Install PostgreSQL (RedHat/CentOS)
+      yum:
+        name:
+          - postgresql-server
+          - postgresql-contrib
+        state: present
+      when: ansible_os_family == "RedHat"
+
+    - name: Initialize PostgreSQL database (RedHat/CentOS)
+      command: postgresql-setup --initdb
+      args:
+        creates: /var/lib/pgsql/data/PG_VERSION
+      when: ansible_os_family == "RedHat"
+      changed_when: false
+
+    - name: Ensure PostgreSQL service is started and enabled
+      systemd:
+        name: postgresql
+        state: started
+        enabled: true
+
+    - name: Find PostgreSQL config file (Debian/Ubuntu)
+      shell: find /etc/postgresql -name postgresql.conf 2>/dev/null | head -1
+      register: pg_config_file_find
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family == "Debian"
+
+    - name: Find PostgreSQL config file (RedHat/CentOS)
+      shell: find /var/lib/pgsql -name postgresql.conf 2>/dev/null | head -1
+      register: pg_config_file_find
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family == "RedHat"
+
+    - name: Get PostgreSQL config file from running instance
+      shell: sudo -u postgres psql -t -c "SHOW config_file;" 2>/dev/null | tr -d ' '
+      register: pg_config_file_query
+      changed_when: false
+      failed_when: false
+
+    - name: Set PostgreSQL config file fact
+      set_fact:
+        pg_config_file: "{{ pg_config_file_query.stdout | default(pg_config_file_find.stdout) | trim }}"
+
+    - name: Find PostgreSQL hba file (Debian/Ubuntu)
+      shell: find /etc/postgresql -name pg_hba.conf 2>/dev/null | head -1
+      register: pg_hba_file_find
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family == "Debian"
+
+    - name: Find PostgreSQL hba file (RedHat/CentOS)
+      shell: find /var/lib/pgsql -name pg_hba.conf 2>/dev/null | head -1
+      register: pg_hba_file_find
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family == "RedHat"
+
+    - name: Get PostgreSQL hba file from running instance
+      shell: sudo -u postgres psql -t -c "SHOW hba_file;" 2>/dev/null | tr -d ' '
+      register: pg_hba_file_query
+      changed_when: false
+      failed_when: false
+
+    - name: Set PostgreSQL hba file fact
+      set_fact:
+        pg_hba_file: "{{ pg_hba_file_query.stdout | default(pg_hba_file_find.stdout) | trim }}"
+
+    - name: Configure PostgreSQL to listen on all interfaces
+      lineinfile:
+        path: "{{ pg_config_file }}"
+        regexp: "^#?listen_addresses\\s*="
+        line: "listen_addresses = '{{ postgres_listen_addresses }}'"
+        backup: true
+      notify: restart postgresql
+
+    - name: Configure PostgreSQL port
+      lineinfile:
+        path: "{{ pg_config_file }}"
+        regexp: "^#?port\\s*="
+        line: "port = {{ postgres_port }}"
+        backup: true
+      notify: restart postgresql
+
+    - name: Allow connections from cluster network in pg_hba.conf
+      lineinfile:
+        path: "{{ pg_hba_file }}"
+        regexp: "^host\\s+all\\s+all\\s+{{ allowed_networks | regex_escape() }}\\s+"
+        line: "host    all             all             {{ allowed_networks }}              md5"
+        backup: true
+        state: present
+      notify: restart postgresql
+
+    - name: Ensure PostgreSQL is listening on the network port
+      wait_for:
+        port: "{{ postgres_port }}"
+        host: "{{ ansible_host }}"
+        delay: 5
+        timeout: 30
+
+    - name: Create k3s database user
+      become_user: postgres
+      shell: |
+        psql -c "SELECT 1 FROM pg_user WHERE usename='{{ k3s_db_user }}'" | grep -q 1 || \
+        psql -c "CREATE USER {{ k3s_db_user }} WITH PASSWORD '{{ k3s_db_password }}';"
+      changed_when: false
+      failed_when: false
+
+    - name: Create k3s database
+      become_user: postgres
+      shell: |
+        psql -lqt | cut -d \| -f 1 | grep -qw {{ k3s_db_name }} || \
+        psql -c "CREATE DATABASE {{ k3s_db_name }} OWNER {{ k3s_db_user }};"
+      changed_when: false
+      failed_when: false
+
+    - name: Grant privileges on k3s database
+      become_user: postgres
+      shell: |
+        psql -d {{ k3s_db_name }} -c "GRANT ALL PRIVILEGES ON DATABASE {{ k3s_db_name }} TO {{ k3s_db_user }};"
+      changed_when: false
+
+    - name: Verify database and user creation
+      become_user: postgres
+      shell: |
+        psql -c "\l {{ k3s_db_name }}" && \
+        psql -c "\du {{ k3s_db_user }}"
+      changed_when: false
+
+  handlers:
+    - name: restart postgresql
+      systemd:
+        name: postgresql
+        state: restarted
